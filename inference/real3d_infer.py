@@ -1,6 +1,5 @@
 import os
 import sys
-sys.path.append('./')
 import torch
 import torch.nn.functional as F
 import torchshow as ts
@@ -8,12 +7,16 @@ import librosa
 import random
 import time
 import numpy as np
-import importlib
 import tqdm
 import copy
 import cv2
 import math
+import requests
 
+# Set PYTORCH_CUDA_ALLOC_CONF to help with memory fragmentation
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+
+sys.path.append('./')
 # common utils
 from utils.commons.hparams import hparams, set_hparams
 from utils.commons.tensor_utils import move_to_cuda, convert_to_tensor
@@ -35,6 +38,13 @@ from inference.infer_utils import mirror_index, load_img_to_512_hwc_array, load_
 from inference.infer_utils import smooth_camera_sequence, smooth_features_xd
 from inference.edit_secc import blink_eye_for_secc
 
+def download_file(url, local_path):
+    with requests.get(url, stream=True) as r:
+        r.raise_for_status()
+        with open(local_path, 'wb') as f:
+            for chunk in r.iter_content(chunk_size=8192):
+                f.write(chunk)
+    return local_path
 
 def read_first_frame_from_a_video(vid_name):
     frames = []
@@ -75,8 +85,10 @@ def cal_face_area_percent(img_name):
 
 def crop_img_on_face_area_percent(img_name, out_name='temp/cropped_src_img.png', min_face_area_percent=0.2):
     try:
+        # Ensure the output directory exists
         os.makedirs(os.path.dirname(out_name), exist_ok=True)
     except: pass
+        
     face_area_percent = cal_face_area_percent(img_name)
     if face_area_percent >= min_face_area_percent:
         print(f"face area percent {face_area_percent} larger than threshold {min_face_area_percent}, directly use the input image...")
@@ -179,6 +191,13 @@ class GeneFace2Infer:
 
     def infer_once(self, inp):
         self.inp = inp
+
+        # Download src_image_name and drv_audio_name if they are URLs
+        if inp['src_image_name'].startswith('http'):
+            inp['src_image_name'] = download_file(inp['src_image_name'], 'src_image.png')
+        if inp['drv_audio_name'].startswith('http'):
+            inp['drv_audio_name'] = download_file(inp['drv_audio_name'], 'drv_audio.wav')
+            
         samples = self.prepare_batch_from_inp(inp)
         seed = inp['seed'] if inp['seed'] is not None else int(time.time())
         random.seed(seed)
@@ -471,6 +490,9 @@ class GeneFace2Infer:
                         gen_output = self.secc2video_model.forward(img=ref_img_head, camera=camera[i:i+1], cond=cond, ret={}, cache_backbone=False, use_cached_backbone=True)
                     img = ((gen_output['image']+1)/2 * 255.).permute(0, 2, 3, 1)[0].int().cpu().numpy().astype(np.uint8)
                     writer.append_data(img)
+                    # Free up memory after each frame
+                    del gen_output
+                    torch.cuda.empty_cache()
             writer.close()
         else:
             img_raw_lst = []
@@ -490,6 +512,9 @@ class GeneFace2Infer:
                     img_lst.append(gen_output['image'])
                     img_raw_lst.append(gen_output['image_raw'])
                     depth_img_lst.append(gen_output['image_depth'])
+                    # Free up memory after each frame
+                    del gen_output
+                    torch.cuda.empty_cache()
 
             # save demo video
             depth_imgs = torch.cat(depth_img_lst)
@@ -539,7 +564,9 @@ class GeneFace2Infer:
             if ret != 0: # 没有成功从drv_audio_name里面提取到音频, 则直接输出无音频轨道的纯视频
                 os.system(f"mv {debug_name} {out_fname}")
         print(f"Saved at {out_fname}")
+     
         return out_fname
+        
         
     @torch.no_grad()
     def forward_system(self, batch, inp):
@@ -558,7 +585,9 @@ class GeneFace2Infer:
         inp = inp_tmp
 
         infer_instance = cls(inp['a2m_ckpt'], inp['head_ckpt'], inp['torso_ckpt'], inp=inp)
-        infer_instance.infer_once(inp)
+        res = infer_instance.infer_once(inp)
+        print(f"Output is {res}")
+        return res
 
     ##############
     # IO-related
@@ -588,7 +617,7 @@ if __name__ == '__main__':
     parser.add_argument("--src_img", default='data/raw/examples/Macron.png', type=str) # data/raw/examples/Macron.png
     parser.add_argument("--bg_img", default='', type=str) # data/raw/examples/bg.png
     parser.add_argument("--drv_aud", default='data/raw/examples/Obama_5s.wav', type=str) # data/raw/examples/Obama_5s.wav
-    parser.add_argument("--drv_pose", default='data/raw/examples/May_5s.mp4', type=str) # data/raw/examples/May_5s.mp4
+    parser.add_argument("--drv_pose", default='data/raw/examples/drv-video-test.mp4', type=str) # data/raw/examples/May_5s.mp4
     parser.add_argument("--blink_mode", default='period', type=str) # none | period
     parser.add_argument("--temperature", default=0.2, type=float) # sampling temperature in audio2motion, higher -> more diverse, less accurate
     parser.add_argument("--mouth_amp", default=0.45, type=float) # scale of predicted mouth, enabled in audio-driven
@@ -622,4 +651,4 @@ if __name__ == '__main__':
             'low_memory_usage': args.low_memory_usage,
             }
 
-    GeneFace2Infer.example_run(inp)
+    #GeneFace2Infer.example_run(inp)
